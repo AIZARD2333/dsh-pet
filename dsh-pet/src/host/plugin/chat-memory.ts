@@ -14,6 +14,7 @@ import { findPetInstance, readAllConfig, removeRoundsByTs, sliceMemoryRounds } f
 import type { PetImageRef } from '../image-attachment.ts';
 import { limitPool, matchMeme, pickMeme, readMemePool } from '../memes.ts';
 import { generateWhisper } from '../whisper.ts';
+import { isPetWorking, PET_WORK_BUBBLE_LIMIT, runPetWork, type PetWorkHost } from '../pet-work.ts';
 import { createMemoryOrphans } from './memory-orphans.ts';
 import { configuredModel } from '../model-selection.ts';
 import { SLEEP_TALK_INSTRUCTION } from '../whisper.ts';
@@ -43,6 +44,19 @@ function isChatTurn(value: unknown): value is ChatTurn {
 /** 这一句该由哪一端念：取宠物实例的 display 推导（桌面优先）；两端都不显示时为 `undefined`。 */
 function voiceTargetFor(pet: Record<string, unknown>): VoiceTarget | undefined {
   return pickVoiceSurface(String(pet.display ?? '')) ?? undefined;
+}
+
+/** 干活触发：`!` / `！` / `/work` 开头；返回值是去掉前缀后的任务正文，不是触发时 undefined。 */
+const WORK_TRIGGER = /^(?:!|！|\/work(?:\s|$))\s*/i;
+
+/**
+ * 从一条聊天输入里取出干活任务。
+ *
+ * @param text - 用户原始输入。
+ * @returns 触发时返回任务正文（可能为空串）；不触发时 undefined。
+ */
+function takeWorkTask(text: string): string | undefined {
+  return WORK_TRIGGER.test(text) ? text.replace(WORK_TRIGGER, '').trim() : undefined;
 }
 
 /** 对话与记忆的输入：装配期对象与更早的工厂。 */
@@ -294,6 +308,86 @@ export function createChatMemory(deps: ChatMemoryInput) {
     return true;
   };
 
+  /** 干活完成后的记忆落盘：user 任务与 assistant 结果共用同一个 ts（聊天窗口按轮分组）。 */
+  const recordWorkTurn = async (petId: string, task: string, reply: string): Promise<void> =>
+    withMemoryLock(async () => {
+      const cfg = readAllConfig(configPaths);
+      const found = findPetInstance(cfg, petId);
+      if (!found) return;
+      const mem = await readMemory();
+      const bucket =
+        mem[found.entry] && typeof mem[found.entry] === 'object' && !Array.isArray(mem[found.entry])
+          ? mem[found.entry]
+          : (mem[found.entry] = {});
+      const existing = bucket[petId];
+      const entry = existing && Array.isArray(existing.messages) ? existing : (bucket[petId] = { messages: [] });
+      const now = Date.now();
+      entry.messages.push({ role: 'user', content: task, ts: now });
+      entry.messages.push({ role: 'assistant', content: reply, ts: now });
+      await writeMemory(mem);
+    });
+
+  /**
+   * 干活模式：消息以 `!` / `！` / `/work` 开头时，把任务交给真正的 DSH agent 会话。
+   *
+   * 请求本身立即返回回执（客户端 60 秒超时，等不起一轮真正的工作）；
+   * agent 跑完后把结果写进气泡与对话记忆，用户下一次看宠物就能听到。
+   *
+   * @param petId - 目标宠物。
+   * @param text - 用户原始输入（含触发前缀）。
+   * @param image - 本轮附带的图片；干活模式暂不支持。
+   * @returns 触发时返回回执或结构化失败；未触发时 undefined。
+   */
+  const workWithPet = async (
+    petId: string,
+    text: string,
+    image?: PetImageRef,
+  ): Promise<
+    | { ok: true; text: string; image?: string }
+    | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet'; message?: string }
+    | undefined
+  > => {
+    const task = takeWorkTask(text);
+    if (task === undefined) return undefined;
+    if (task === '') {
+      return { ok: false, reason: 'generate-error', message: '干活要带任务，比如「!把 README 里的错字改掉」' };
+    }
+    if (image !== undefined) {
+      return {
+        ok: false,
+        reason: 'generate-error',
+        message: '干活模式先别带图：把图放进工作区，再告诉本鱼路径',
+      };
+    }
+    const cfg = readAllConfig(configPaths);
+    const found = findPetInstance(cfg, petId);
+    if (!found) return { ok: false, reason: 'unknown-pet', message: '没有这只桌宠：' + petId };
+    if (isPetWorking(petId)) {
+      const busy = '上一件还没干完，等本鱼腾出手来';
+      state.writePet(petId, 'say', { text: busy });
+      return { ok: true, text: busy };
+    }
+
+    const ack = '收到，本鱼去干活了。干完喊你。';
+    state.writePet(petId, 'say', { text: ack });
+    void runPetWork({ ctx: ctx as unknown as PetWorkHost, log, petId, text: task })
+      .then(async (result) => {
+        const reply = result.ok ? result.text : `干活失败：${result.message}`;
+        await recordWorkTurn(petId, task, reply);
+        const shown = reply.length > PET_WORK_BUBBLE_LIMIT ? `${reply.slice(0, PET_WORK_BUBBLE_LIMIT)}…` : reply;
+        const fresh = findPetInstance(readAllConfig(configPaths), petId);
+        const voiceTo = fresh === undefined ? undefined : voiceTargetFor(fresh.pet);
+        state.writePet(petId, 'say', { text: shown, ...(voiceTo === undefined ? {} : { voiceTo }) });
+      })
+      .catch(async (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        log.error(`[dsh-pet] 干活回调失败 pet=${petId}：${message}`);
+        await recordWorkTurn(petId, task, `干活失败：${message}`).catch(() => undefined);
+        state.writePet(petId, 'say', { text: `干活失败：${message}` });
+      });
+    return { ok: true, text: ack };
+  };
+
   /** 与某只宠物对话：截取最近记忆 → 生成回复 → 写入记忆 → 写进 S 的 pets.<id>.say。
    *  供 POST /chat 与 /chat 命令共用（锁内读写，防两端交错写盘）；成功带回回复文本。 */
   const chatWithPet = async (
@@ -303,8 +397,10 @@ export function createChatMemory(deps: ChatMemoryInput) {
   ): Promise<
     | { ok: true; text: string; image?: string }
     | { ok: false; reason: 'provider-missing' | 'generate-error' | 'unknown-pet'; message?: string }
-  > =>
-    withMemoryLock(async () => {
+  > => {
+    const work = await workWithPet(petId, text, image);
+    if (work !== undefined) return work;
+    return withMemoryLock(async () => {
       const cfg = readAllConfig(configPaths);
       const found = findPetInstance(cfg, petId);
       // 宠物在「校验那次读」与这里之间被删了——本函数还要先排 withMemoryLock 的串行队列，
@@ -405,6 +501,7 @@ export function createChatMemory(deps: ChatMemoryInput) {
       // 同一份文本随返回值带出（叶子照写，不是二选一）
       return { ok: true as const, text: generated.text, ...(generated.image ? { image: generated.image } : {}) };
     });
+  };
 
   /** 删除某只宠物的对话记忆：`ts` 缺省 = 清空全部，给了 ts = 只删命中的轮（一轮两条共享 ts，成对删）。
    *  与对话共用同一条串行队列——删除不会插进一次回复的读-改-写中间，也不会被它覆盖写回。
